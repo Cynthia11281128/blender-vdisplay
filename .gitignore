@@ -1,0 +1,14 @@
+# Official Blender installations; keep management code in Git.
+/blender-*-linux-*/
+
+# Local downloads, installation logs, and acceptance evidence.
+/artifacts/
+
+# Per-session data and generated screenshots.
+/user-config/
+/projects/
+/screenshots/
+
+# Python-generated cache files.
+__pycache__/
+*.py[cod]
