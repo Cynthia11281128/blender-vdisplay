@@ -1,9 +1,13 @@
 import json
 import os
 from pathlib import Path
+import sys
 
 import bpy
 import gpu
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from control_server import ControlServer
 
 
 state_dir = Path(os.environ["BLENDER_STATE_DIR"])
@@ -12,6 +16,8 @@ bpy.context.preferences.view.show_splash = False
 bpy.context.scene.render.threads_mode = "FIXED"
 bpy.context.scene.render.threads = threads
 bpy.context.scene.cycles.device = "CPU"
+control_server = ControlServer(os.environ["BLENDER_CONTROL_SOCKET"],
+                               os.environ["BLENDER_SESSION_TOKEN"], bpy).start()
 
 
 def record_session():
@@ -40,11 +46,14 @@ def record_session():
         "cpus": sorted(os.sched_getaffinity(0)),
         "config_dir": os.environ["BLENDER_USER_CONFIG"],
         "project_dir": os.getcwd(),
+        "control": {"protocol_version": 1, "socket_path": control_server.path, "ready": True},
     }
     temporary = state_dir / "ready.json.tmp"
     temporary.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     temporary.replace(state_dir / "ready.json")
-    print("BLENDER_SESSION_READY " + json.dumps(report), flush=True)
+    log_report = dict(report)
+    log_report.pop("token")
+    print("BLENDER_SESSION_READY " + json.dumps(log_report), flush=True)
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             area.tag_redraw()

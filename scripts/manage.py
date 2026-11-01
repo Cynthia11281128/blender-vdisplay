@@ -17,6 +17,11 @@ import uuid
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+# -I excludes the script directory; load only this repository's trusted modules.
+sys.path.insert(0, str(BASE_DIR / "scripts"))
+import control_client
+import control_protocol
+
 RUN_USER = "blender-vdisplay"
 RUN_HOME = Path("/var/lib/blender-vdisplay")
 STATE_ROOT = RUN_HOME / ".local/state/blender-virtual"
@@ -118,6 +123,7 @@ class Session:
         self.project = BASE_DIR / "projects" / name
         self.shots = BASE_DIR / "screenshots" / name
         self.runtime = RUN_HOME / ".cache/blender-virtual" / name / "runtime"
+        self.control_socket = Path(control_protocol.socket_path(self.runtime / "control.sock"))
 
     def prepare(self):
         for directory in (self.state, self.config, self.project, self.runtime):
@@ -138,6 +144,7 @@ class Session:
             "XDG_RUNTIME_DIR": str(self.runtime), "BLENDER_USER_CONFIG": str(self.config),
             "BLENDER_STATE_DIR": str(self.state), "BLENDER_SESSION_ID": self.name,
             "BLENDER_SESSION_TOKEN": metadata.get("token", ""), "BLENDER_THREADS": threads,
+            "BLENDER_CONTROL_SOCKET": str(self.control_socket),
             "LIBGL_ALWAYS_SOFTWARE": "true", "GALLIUM_DRIVER": "llvmpipe",
             "LP_NUM_THREADS": threads, "OMP_NUM_THREADS": threads, "OPENBLAS_NUM_THREADS": threads,
             "CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "",
@@ -159,7 +166,24 @@ class Session:
 
     def ready(self, metadata):
         value = read_json(self.state / "ready.json")
-        return value if value and value.get("token") == metadata["token"] else None
+        return value if (
+            value and value.get("token") == metadata["token"] and
+            value.get("pid") == (metadata.get("blender") or {}).get("pid") and
+            value.get("uid") == (metadata.get("blender") or {}).get("uid")
+        ) else None
+
+    def control_ready(self, metadata):
+        ready = self.ready(metadata)
+        control = (ready or {}).get("control", {})
+        return bool(control.get("ready") is True and
+                    control.get("protocol_version") == control_protocol.PROTOCOL_VERSION and
+                    control.get("socket_path") == str(self.control_socket) and
+                    self.control_socket.is_socket())
+
+    def cleanup_control(self, metadata):
+        current = read_json(self.metadata)
+        if current and current.get("token") == metadata.get("token") and self.control_socket.exists():
+            self.control_socket.unlink()
 
 
 def dropped_command(command, environment):
@@ -215,7 +239,7 @@ def wait_ready(session):
     deadline = time.monotonic() + START_TIMEOUT + 5
     while time.monotonic() < deadline:
         state, metadata = session.status()
-        if state == "RUNNING" and session.ready(metadata):
+        if state == "RUNNING" and session.control_ready(metadata):
             print("Blender session '{}' ready on :{}.".format(session.name, metadata["display_number"]))
             print(json.dumps(session.ready(metadata), indent=2))
             return
@@ -234,6 +258,8 @@ def start(session, requested):
     with lock(session.state / "operation.lock"):
         state, metadata = session.status()
         if state == "RUNNING":
+            if not session.control_ready(metadata):
+                raise RuntimeError("Existing session has no ready control interface; save, stop and restart it explicitly.")
             print("Session '{}' already running; existing CPU/display settings unchanged.".format(session.name))
             return
         if state == "STARTING":
@@ -259,6 +285,7 @@ def start(session, requested):
                 "started_at": timestamp(), "supervisor": None, "blender": None, "xvfb": None,
             }
             write_json(session.metadata, metadata)
+            session.cleanup_control(metadata)
             for filename in ("ready.json", "ready.json.tmp"):
                 path = session.state / filename
                 if path.exists():
@@ -287,6 +314,7 @@ def start(session, requested):
                 else:
                     metadata.update(status="failed", error=str(error), stopped_at=timestamp())
                     write_json(session.metadata, metadata)
+                    session.cleanup_control(metadata)
                 raise
         wait_ready(session)
 
@@ -307,8 +335,23 @@ def stop(session):
         print("Session '{}' stopped; its Blender and Xvfb cleaned up.".format(session.name))
 
 
-def status(session):
+def status(session, as_json=False):
     state, metadata = session.status()
+    if as_json:
+        value = {
+            "session": session.name, "state": state,
+            "generation": metadata.get("token") if metadata else None,
+            "display": ":{}".format(metadata["display_number"]) if metadata else None,
+            "control": {"protocol_version": control_protocol.PROTOCOL_VERSION,
+                        "socket_path": str(session.control_socket),
+                        "ready": state == "RUNNING" and session.control_ready(metadata)},
+        }
+        if metadata:
+            value.update({key: metadata.get(key) for key in
+                          ("supervisor", "blender", "xvfb", "cpus", "threads", "started_at", "stopped_at", "error")})
+            value.update(project_dir=str(session.project), config_dir=str(session.config))
+        print(json.dumps(value, allow_nan=False))
+        return 0 if state == "RUNNING" else 1
     print("{}: {}".format(session.name, state))
     if metadata:
         print(json.dumps(metadata, indent=2))
@@ -318,6 +361,26 @@ def status(session):
     print(json.dumps(session.ready(metadata), indent=2))
     subprocess.run(["/usr/bin/xwininfo", "-root", "-tree"], env=session.env(metadata), check=True)
     return 0
+
+
+def execute(session, code=None, script=None, timeout=30):
+    if script is not None:
+        filename = str(Path(script).resolve())
+        with open(filename, "rb") as source:
+            data = source.read(control_protocol.MAX_CODE + 1)
+        if len(data) > control_protocol.MAX_CODE:
+            raise ValueError("Script exceeds 1 MiB code limit.")
+        code = data.decode("utf-8")
+    else:
+        filename = "<blenderctl>"
+    state, metadata = session.status()
+    if state != "RUNNING":
+        raise RuntimeError("Session '{}' is not running; it will not be started automatically.".format(session.name))
+    if not session.control_ready(metadata):
+        raise RuntimeError("Control interface not ready; existing older sessions require an explicit stop and restart.")
+    value = control_client.execute(str(session.control_socket), metadata["token"], code, timeout, filename)
+    print(json.dumps(value, allow_nan=False))
+    return 0 if value["ok"] else 1
 
 
 def list_sessions():
@@ -448,7 +511,7 @@ def supervise(session):
                         break
                     if metadata["status"] == "starting":
                         ready = session.ready(metadata)
-                        if ready and ready.get("background") is False and ready.get("windows"):
+                        if ready and ready.get("background") is False and ready.get("windows") and session.control_ready(metadata):
                             metadata["status"] = "running"
                             write_json(session.metadata, metadata)
                         elif time.monotonic() > deadline:
@@ -461,6 +524,7 @@ def supervise(session):
             finally:
                 terminate(blender, group=True)
                 terminate(xvfb)
+                session.cleanup_control(metadata)
                 for filename in ("Xauthority", "ready.json", "ready.json.tmp"):
                     path = session.state / filename
                     if path.exists():
@@ -476,17 +540,30 @@ def main(argv=None):
         supervise(Session(argv[1]))
         return 0
     parser = argparse.ArgumentParser(prog="blenderctl", description="Manage independent Blender + Xvfb sessions.")
-    parser.add_argument("action", choices=("start", "list", "status", "screenshot", "stop", "attach"), nargs="?", default="status")
+    parser.add_argument("action", choices=("start", "list", "status", "screenshot", "stop", "attach", "exec"), nargs="?", default="status")
     parser.add_argument("session", nargs="?", default=None, help="session name (default: default)")
     parser.add_argument("--cpus", help="start-only CPU affinity, e.g. 0-7; otherwise allocate 8 unused CPUs")
+    parser.add_argument("--json", action="store_true", help="status-only machine-readable JSON")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--code", help="exec-only Python source")
+    source.add_argument("--script", help="exec-only caller-readable UTF-8 script")
+    parser.add_argument("--timeout", type=control_protocol.positive_timeout, default=None,
+                        help="exec-only client waiting deadline in seconds (default: 30)")
     args = parser.parse_args(argv)
     if args.action == "list" and args.session is not None:
         parser.error("list does not take a session name")
     if args.cpus is not None and args.action != "start":
         parser.error("--cpus is only valid for start")
+    if args.json and args.action != "status":
+        parser.error("--json is only valid for status")
+    if args.action == "exec":
+        if args.code is None and args.script is None:
+            parser.error("exec requires --code or --script")
+    elif args.code is not None or args.script is not None or args.timeout is not None:
+        parser.error("--code, --script and --timeout are only valid for exec")
     session = Session(args.session or "default")
     account = pwd.getpwnam(RUN_USER)
-    if os.geteuid() == 0 and args.action != "screenshot":
+    if os.geteuid() == 0 and args.action not in ("screenshot", "exec"):
         command = dropped_command(["/usr/bin/python3", "-I", str(Path(__file__).resolve())] + argv, session.env())
         os.execv(command[0], command)
     if os.geteuid() not in (0, account.pw_uid):
@@ -497,7 +574,9 @@ def main(argv=None):
     elif args.action == "stop":
         stop(session)
     elif args.action == "status":
-        return status(session)
+        return status(session, args.json)
+    elif args.action == "exec":
+        return execute(session, args.code, args.script, args.timeout if args.timeout is not None else 30)
     elif args.action == "list":
         list_sessions()
     elif args.action == "screenshot":
