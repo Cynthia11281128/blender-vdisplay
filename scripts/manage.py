@@ -21,6 +21,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR / "scripts"))
 import control_client
 import control_protocol
+import sandbox
 
 RUN_USER = "blender-vdisplay"
 RUN_HOME = Path("/var/lib/blender-vdisplay")
@@ -100,13 +101,13 @@ def parse_cpus(value, allowed):
     return sorted(selected)
 
 
-def select_cpus(allowed, used, requested=None):
+def select_cpus(allowed, used, requested=None, count=8):
     if requested is not None:
         return parse_cpus(requested, allowed)
     available = sorted(allowed - used)
-    if len(available) < 8:
-        raise ValueError("Fewer than 8 unassigned logical CPUs; specify --cpus explicitly or stop a session.")
-    return available[:8]
+    if len(available) < count:
+        raise ValueError("Fewer than {} unassigned logical CPUs; specify --cpus explicitly or stop a session.".format(count))
+    return available[:count]
 
 
 def cpu_text(cpus):
@@ -124,6 +125,7 @@ class Session:
         self.shots = BASE_DIR / "screenshots" / name
         self.runtime = RUN_HOME / ".cache/blender-virtual" / name / "runtime"
         self.control_socket = Path(control_protocol.socket_path(self.runtime / "control.sock"))
+        self.sandbox_record = STATE_ROOT / "sandbox" / "{}.json".format(name)
 
     def prepare(self):
         for directory in (self.state, self.config, self.project, self.runtime):
@@ -145,15 +147,36 @@ class Session:
             "BLENDER_STATE_DIR": str(self.state), "BLENDER_SESSION_ID": self.name,
             "BLENDER_SESSION_TOKEN": metadata.get("token", ""), "BLENDER_THREADS": threads,
             "BLENDER_CONTROL_SOCKET": str(self.control_socket),
+            "BLENDER_CONTROL_MODE": metadata.get("control_mode", "threaded"),
             "LIBGL_ALWAYS_SOFTWARE": "true", "GALLIUM_DRIVER": "llvmpipe",
             "LP_NUM_THREADS": threads, "OMP_NUM_THREADS": threads, "OPENBLAS_NUM_THREADS": threads,
             "CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "",
+            **sandbox_environment(metadata),
         }
+
+    def live_sandbox(self):
+        """The root-owned record of a running sandbox; session.json is writable from inside."""
+        record = read_json(self.sandbox_record)
+        return record if record and host_alive(record.get("unshare")) else None
+
+    def generation(self, metadata):
+        record = self.live_sandbox()
+        return record["token"] if record else (metadata or {}).get("token")
 
     def status(self):
         metadata = read_json(self.metadata)
+        record = self.live_sandbox()
+        if record:
+            # Pids in session.json belong to the namespace and cannot be checked here.
+            current = metadata if metadata and metadata.get("token") == record["token"] else None
+            if current and current["status"] == "running" and current.get("supervisor"):
+                return "RUNNING", current
+            return "STARTING" if current and current["status"] == "starting" else "STOPPING", metadata
         if not metadata:
             return "NOT_STARTED", None
+        if metadata.get("sandbox"):
+            # Its pids were namespace-local; once the namespace is gone nothing of it survives.
+            return "FAILED" if metadata["status"] == "failed" else "STOPPED", metadata
         if alive(metadata.get("supervisor")):
             if metadata["status"] == "running" and all(
                 alive(metadata.get(child)) for child in ("blender", "xvfb")
@@ -186,6 +209,37 @@ class Session:
             self.control_socket.unlink()
 
 
+def sandbox_environment(metadata):
+    tmpdir = (metadata.get("sandbox") or {}).get("tmpdir")
+    return {"TMPDIR": tmpdir, "TMP": tmpdir, "TEMP": tmpdir} if tmpdir else {}
+
+
+def host_identity(pid):
+    try:
+        fields = Path("/proc/{}/stat".format(pid)).read_text().rsplit(")", 1)[1].split()
+        return None if fields[0] == "Z" else {"pid": pid, "start_time": fields[19]}
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def host_alive(record):
+    # uid is omitted: exec drops the account after the identity is recorded.
+    return bool(record and host_identity(record["pid"]) == record)
+
+
+def host_children(pid):
+    result = []
+    for path in Path("/proc").iterdir():
+        if path.name.isdigit():
+            try:
+                fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if fields[1] == str(pid):
+                result.append(int(path.name))
+    return result
+
+
 def dropped_command(command, environment):
     account = pwd.getpwnam(RUN_USER)
     return ["/usr/bin/setpriv", "--reuid={}".format(account.pw_uid),
@@ -213,7 +267,10 @@ def used_cpus():
     result = set()
     for path in (STATE_ROOT / "sessions").glob("*/session.json"):
         metadata = read_json(path)
-        if metadata and any(alive(metadata.get(child)) for child in ("supervisor", "blender", "xvfb")):
+        record = read_json(STATE_ROOT / "sandbox" / "{}.json".format(path.parent.name))
+        if record and host_alive(record.get("unshare")):
+            result.update(record["cpus"])
+        elif metadata and not metadata.get("sandbox") and any(alive(metadata.get(child)) for child in ("supervisor", "blender", "xvfb")):
             result.update(metadata.get("cpus", []))
     return result
 
@@ -225,6 +282,16 @@ def send_stop(metadata):
     os.kill(supervisor["pid"], signal.SIGTERM)
 
 
+def request_stop(session, metadata):
+    record = session.live_sandbox()
+    if not record:
+        send_stop(metadata)
+    elif host_alive(record.get("supervisor")):
+        os.kill(record["supervisor"]["pid"], signal.SIGTERM)
+    else:
+        raise RuntimeError("Sandbox supervisor is not known; no signal sent.")
+
+
 def wait_stopped(session, timeout=20):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -232,6 +299,11 @@ def wait_stopped(session, timeout=20):
         if state in ("STOPPED", "FAILED", "NOT_STARTED"):
             return
         time.sleep(0.1)
+    record = session.live_sandbox()
+    if record and host_alive(record.get("supervisor")):
+        # Pid 1 dying takes every process in the namespace with it.
+        os.kill(record["supervisor"]["pid"], signal.SIGKILL)
+        return wait_stopped(session, 5)
     raise RuntimeError("Stop timed out; inspect {} (no unrelated processes were signalled).".format(session.state))
 
 
@@ -247,13 +319,61 @@ def wait_ready(session):
             raise RuntimeError("Startup {}: {}; inspect {}.".format(state.lower(), metadata.get("error", ""), session.state))
         time.sleep(0.2)
     metadata = read_json(session.metadata)
-    if alive(metadata.get("supervisor")):
-        send_stop(metadata)
+    if session.live_sandbox() or alive(metadata.get("supervisor")):
+        request_stop(session, metadata)
         wait_stopped(session)
     raise RuntimeError("Startup timed out; inspect {}.".format(session.state))
 
 
-def start(session, requested):
+@contextlib.contextmanager
+def privileged():
+    """Sandbox starts run as the account, returning to root only to create namespaces."""
+    uid, gid = os.geteuid(), os.getegid()
+    os.seteuid(0)
+    os.setegid(0)
+    try:
+        yield
+    finally:
+        os.setegid(gid)
+        os.seteuid(uid)
+
+
+def launch_sandbox(session, metadata, spec):
+    account = pwd.getpwnam(RUN_USER)
+    writable = (session.state, session.runtime, session.config, session.project)
+    plan = sandbox.mount_plan(spec, BASE_DIR / "blender-4.5.15-linux-x64", BASE_DIR / "scripts", writable,
+                              RUN_HOME, STATE_ROOT / "displays", (account.pw_uid, account.pw_gid))
+    command = dropped_command(["/usr/bin/python3", "-I", str(BASE_DIR / "scripts/manage.py"),
+                               "--supervise", session.name], session.env(metadata))
+    record = {"session": session.name, "token": metadata["token"], "cpus": metadata["cpus"],
+              "spec": spec, "plan": plan, "command": command, "home": str(RUN_HOME),
+              "account": [account.pw_uid, account.pw_gid], "unshare": None, "supervisor": None}
+    log = (session.state / "sandbox-init.log").open("w")
+    with log, privileged():
+        directory = session.sandbox_record.parent
+        directory.mkdir(mode=0o755, exist_ok=True)
+        directory.chmod(0o755)
+        write_json(session.sandbox_record, record)
+        session.sandbox_record.chmod(0o644)
+        process = subprocess.Popen(
+            ["/usr/bin/unshare", "--mount", "--pid", "--net", "--ipc", "--uts", "--fork", "--kill-child",
+             "/usr/bin/python3", "-I", str(BASE_DIR / "scripts/sandbox.py"), "--init", str(session.sandbox_record)],
+            env={"PATH": "/usr/bin"}, cwd="/", stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True)
+        record["unshare"] = host_identity(process.pid)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and process.poll() is None:
+            children = host_children(process.pid)
+            if children:
+                record["supervisor"] = host_identity(children[0])
+                break
+            time.sleep(0.02)
+        write_json(session.sandbox_record, record)
+        session.sandbox_record.chmod(0o644)
+    return process
+
+
+def start(session, requested, count=8, spec=None, control_mode="threaded"):
     session.prepare()
     with lock(session.state / "operation.lock"):
         state, metadata = session.status()
@@ -276,14 +396,18 @@ def start(session, requested):
                 raise RuntimeError("Invalid legacy PID file; inspect it before starting.")
         with lock(STATE_ROOT / "allocation.lock"):
             used = used_cpus()
-            cpus = select_cpus(set(os.sched_getaffinity(0)), used, requested)
+            cpus = select_cpus(set(os.sched_getaffinity(0)), used, requested, count)
             if set(cpus) & used:
                 print("Warning: explicit CPU selection overlaps another managed session.", file=sys.stderr)
             metadata = {
                 "session": session.name, "token": uuid.uuid4().hex, "status": "starting",
-                "display_number": allocate(), "cpus": cpus, "threads": min(8, len(cpus)),
+                # A sandbox has a private /tmp and X namespace, so its display number is fixed.
+                "display_number": 99 if spec else allocate(), "cpus": cpus, "threads": min(8, len(cpus)),
                 "started_at": timestamp(), "supervisor": None, "blender": None, "xvfb": None,
+                "control_mode": control_mode or "threaded",
             }
+            if spec:
+                metadata["sandbox"] = {"tmpdir": spec["tmpdir"]}
             write_json(session.metadata, metadata)
             session.cleanup_control(metadata)
             for filename in ("ready.json", "ready.json.tmp"):
@@ -294,13 +418,20 @@ def start(session, requested):
             command = "exec /bin/bash {} {}".format(shlex.quote(str(BASE_DIR / "scripts/session.sh")),
                                                     shlex.quote(session.name))
             try:
-                session.tmux("-f", "/dev/null", "new-session", "-d", "-s", "blender-virtual", command,
-                             env=session.env(metadata), check=True)
+                process = None
+                if spec:
+                    process = launch_sandbox(session, metadata, spec)
+                else:
+                    session.tmux("-f", "/dev/null", "new-session", "-d", "-s", "blender-virtual", command,
+                                 env=session.env(metadata), check=True)
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
                     metadata = read_json(session.metadata)
-                    if alive(metadata.get("supervisor")):
+                    if metadata.get("supervisor") and (spec or alive(metadata["supervisor"])):
                         break
+                    if process and process.poll() is not None:
+                        raise RuntimeError("Sandbox did not start: {}".format(
+                            (session.state / "sandbox-init.log").read_text()[-2000:]))
                     if metadata["status"] == "failed":
                         raise RuntimeError(metadata.get("error", "Supervisor failed."))
                     time.sleep(0.1)
@@ -308,8 +439,8 @@ def start(session, requested):
                     raise RuntimeError("Supervisor did not acknowledge startup.")
             except (RuntimeError, subprocess.CalledProcessError) as error:
                 metadata = read_json(session.metadata)
-                if alive(metadata.get("supervisor")):
-                    send_stop(metadata)
+                if session.live_sandbox() or alive(metadata.get("supervisor")):
+                    request_stop(session, metadata)
                     wait_stopped(session)
                 else:
                     metadata.update(status="failed", error=str(error), stopped_at=timestamp())
@@ -319,7 +450,7 @@ def start(session, requested):
         wait_ready(session)
 
 
-def stop(session):
+def stop(session, generation=None):
     if not session.state.exists():
         print("Session '{}' is not running; no signal sent.".format(session.name))
         return
@@ -330,7 +461,9 @@ def stop(session):
             return
         if state == "ORPHANED":
             raise RuntimeError("Supervisor missing but child still alive; refusing to signal an unverified target.")
-        send_stop(metadata)
+        if generation is not None and generation != session.generation(metadata):
+            raise RuntimeError("Session generation does not match; no signal sent.")
+        request_stop(session, metadata)
         wait_stopped(session)
         print("Session '{}' stopped; its Blender and Xvfb cleaned up.".format(session.name))
 
@@ -340,9 +473,10 @@ def status(session, as_json=False):
     if as_json:
         value = {
             "session": session.name, "state": state,
-            "generation": metadata.get("token") if metadata else None,
+            "generation": session.generation(metadata),
             "display": ":{}".format(metadata["display_number"]) if metadata else None,
             "control": {"protocol_version": control_protocol.PROTOCOL_VERSION,
+                        "mode": (metadata or {}).get("control_mode", "threaded"),
                         "socket_path": str(session.control_socket),
                         "ready": state == "RUNNING" and session.control_ready(metadata)},
         }
@@ -350,6 +484,10 @@ def status(session, as_json=False):
             value.update({key: metadata.get(key) for key in
                           ("supervisor", "blender", "xvfb", "cpus", "threads", "started_at", "stopped_at", "error")})
             value.update(project_dir=str(session.project), config_dir=str(session.config))
+        record = session.live_sandbox()
+        if record:
+            # supervisor/blender/xvfb above are pids inside the namespace.
+            value["sandbox"] = {"host_supervisor": record["supervisor"], "spec": record["spec"]}
         print(json.dumps(value, allow_nan=False))
         return 0 if state == "RUNNING" else 1
     print("{}: {}".format(session.name, state))
@@ -357,6 +495,8 @@ def status(session, as_json=False):
         print(json.dumps(metadata, indent=2))
     if state != "RUNNING":
         return 1
+    if session.live_sandbox():
+        return 0
     subprocess.run(["/usr/bin/xdpyinfo"], env=session.env(metadata), stdout=subprocess.DEVNULL, check=True)
     print(json.dumps(session.ready(metadata), indent=2))
     subprocess.run(["/usr/bin/xwininfo", "-root", "-tree"], env=session.env(metadata), check=True)
@@ -398,6 +538,8 @@ def screenshot(session):
         raise RuntimeError("Publish screenshots from the root terminal.")
     if not session.state.exists():
         raise RuntimeError("Session '{}' has not been started.".format(session.name))
+    if session.live_sandbox():
+        raise RuntimeError("Sandbox sessions have no host-visible display; render through exec.")
     with lock(session.state / "operation.lock"):
         state, metadata = session.status()
         if state != "RUNNING":
@@ -440,6 +582,35 @@ def terminate(process, group=False):
         process.wait()
 
 
+def reap_adopted(known):
+    """Only as pid 1: adopted orphans would otherwise stay zombies until the namespace ends."""
+    for path in Path("/proc").iterdir():
+        if path.name.isdigit() and int(path.name) not in known:
+            try:
+                fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+                if fields[0] == "Z" and fields[1] == "1":
+                    os.waitpid(int(path.name), os.WNOHANG)
+            except (FileNotFoundError, ProcessLookupError, ChildProcessError):
+                continue
+
+
+def wait_display(xvfb, environment, stopping):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not stopping[0]:
+        if xvfb.poll() is not None:
+            raise RuntimeError("Xvfb exited during startup.")
+        try:
+            # A healthy software X server can take several seconds to answer.
+            if subprocess.run(["/usr/bin/xdpyinfo"], env=environment, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              timeout=min(15, max(0.01, deadline - time.monotonic()))).returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(0.1)
+    raise RuntimeError("Xvfb startup stopped or timed out.")
+
+
 def supervise(session):
     if os.geteuid() != pwd.getpwnam(RUN_USER).pw_uid:
         raise RuntimeError("Supervisor must run as the dedicated account.")
@@ -472,19 +643,10 @@ def supervise(session):
                                             env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
                 metadata["xvfb"] = identity(xvfb.pid)
                 write_json(session.metadata, metadata)
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and not stopping[0]:
-                    if xvfb.poll() is not None:
-                        raise RuntimeError("Xvfb exited during startup.")
-                    if subprocess.run(["/usr/bin/xdpyinfo"], env=environment, stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.DEVNULL, timeout=2).returncode == 0:
-                        break
-                    time.sleep(0.1)
-                else:
-                    raise RuntimeError("Xvfb startup stopped or timed out.")
+                wait_display(xvfb, environment, stopping)
                 with (session.state / "glxinfo.log").open("w") as log:
                     subprocess.run(["/usr/bin/glxinfo", "-B"], env=environment, stdout=log, stderr=log,
-                                   timeout=15, check=True)
+                                   timeout=30, check=True)
                 if stopping[0]:
                     raise RuntimeError("Startup cancelled.")
                 def blender_limits():
@@ -503,6 +665,8 @@ def supervise(session):
                 write_json(session.metadata, metadata)
                 deadline = time.monotonic() + START_TIMEOUT
                 while not stopping[0]:
+                    if os.getpid() == 1:
+                        reap_adopted({xvfb.pid, blender.pid})
                     if xvfb.poll() is not None:
                         raise RuntimeError("Xvfb exited; stopping this session's Blender.")
                     if blender.poll() is not None:
@@ -533,6 +697,27 @@ def supervise(session):
                 write_json(session.metadata, metadata)
 
 
+def positive_count(value):
+    number = int(value)
+    if number < 1:
+        raise ValueError(value)
+    return number
+
+
+def start_sandbox(session, args, account):
+    if os.geteuid() != 0:
+        raise RuntimeError("Sandbox sessions must be started by root.")
+    forbidden = [RUN_HOME, BASE_DIR / "user-config", BASE_DIR / "projects", BASE_DIR / "screenshots"]
+    spec = sandbox.load_spec(args.sandbox, account.pw_uid, forbidden)
+    if session.status()[0] not in ("NOT_STARTED", "STOPPED", "FAILED"):
+        raise RuntimeError("Session is active; a sandbox start needs a stopped or new name.")
+    os.umask(0o077)
+    os.setegid(account.pw_gid)
+    os.seteuid(account.pw_uid)
+    start(session, args.cpus, args.cpu_count or 8, spec, args.control_mode)
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) == 2 and argv[0] == "--supervise":
@@ -543,6 +728,12 @@ def main(argv=None):
     parser.add_argument("action", choices=("start", "list", "status", "screenshot", "stop", "attach", "exec"), nargs="?", default="status")
     parser.add_argument("session", nargs="?", default=None, help="session name (default: default)")
     parser.add_argument("--cpus", help="start-only CPU affinity, e.g. 0-7; otherwise allocate 8 unused CPUs")
+    parser.add_argument("--cpu-count", type=positive_count, default=None,
+                        help="start-only number of unused CPUs to allocate (default: 8); --cpus takes priority")
+    parser.add_argument("--sandbox", help="start-only JSON spec; root only; whitelisted filesystem, no network")
+    parser.add_argument("--generation", help="stop-only token; no signal is sent unless it matches")
+    parser.add_argument("--control-mode", choices=("threaded", "polling"), default=None,
+                        help="start-only control transport; polling avoids Python threads during viewport draws")
     parser.add_argument("--json", action="store_true", help="status-only machine-readable JSON")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--code", help="exec-only Python source")
@@ -554,6 +745,12 @@ def main(argv=None):
         parser.error("list does not take a session name")
     if args.cpus is not None and args.action != "start":
         parser.error("--cpus is only valid for start")
+    if (args.cpu_count is not None or args.sandbox is not None) and args.action != "start":
+        parser.error("--cpu-count and --sandbox are only valid for start")
+    if args.generation is not None and args.action != "stop":
+        parser.error("--generation is only valid for stop")
+    if args.control_mode is not None and args.action != "start":
+        parser.error("--control-mode is only valid for start")
     if args.json and args.action != "status":
         parser.error("--json is only valid for status")
     if args.action == "exec":
@@ -563,6 +760,8 @@ def main(argv=None):
         parser.error("--code, --script and --timeout are only valid for exec")
     session = Session(args.session or "default")
     account = pwd.getpwnam(RUN_USER)
+    if args.sandbox is not None:
+        return start_sandbox(session, args, account)
     if os.geteuid() == 0 and args.action not in ("screenshot", "exec"):
         command = dropped_command(["/usr/bin/python3", "-I", str(Path(__file__).resolve())] + argv, session.env())
         os.execv(command[0], command)
@@ -570,9 +769,9 @@ def main(argv=None):
         raise RuntimeError("Use root or the dedicated {} account.".format(RUN_USER))
     os.umask(0o077)
     if args.action == "start":
-        start(session, args.cpus)
+        start(session, args.cpus, args.cpu_count or 8, control_mode=args.control_mode or "threaded")
     elif args.action == "stop":
-        stop(session)
+        stop(session, args.generation)
     elif args.action == "status":
         return status(session, args.json)
     elif args.action == "exec":
@@ -584,6 +783,8 @@ def main(argv=None):
     elif args.action == "attach":
         if session.status()[0] != "RUNNING":
             raise RuntimeError("Session is not running.")
+        if session.live_sandbox():
+            raise RuntimeError("Sandbox sessions have no tmux terminal.")
         os.execv("/usr/bin/tmux", ["/usr/bin/tmux", "-S", str(session.socket),
                                   "attach-session", "-t", "=blender-virtual"])
     return 0

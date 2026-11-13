@@ -193,5 +193,72 @@ class SocketTests(unittest.TestCase):
                 client.execute(self.path, "g", "pass")
 
 
+class PollingSocketTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="bp-", dir=TEST_TMP)
+        self.path = str(Path(self.directory.name) / "s")
+        self.service = server.PollingControlServer(self.path, "g", mock.Mock()).start()
+
+    def tearDown(self):
+        self.service.close()
+        self.assertFalse(Path(self.path).exists())
+        self.directory.cleanup()
+
+    def exchange(self, value):
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.connect(self.path)
+        connection.sendall(protocol.encode_frame(value, protocol.MAX_REQUEST))
+        for _ in range(5):
+            self.service.tick()
+        with connection:
+            return protocol.receive_frame(connection, protocol.MAX_RESPONSE, time.monotonic() + 2)
+
+    def test_success_generation_and_no_transport_threads(self):
+        self.assertFalse(hasattr(self.service, "accept_thread"))
+        self.assertEqual(self.exchange(request())["result"], 42)
+        self.assertEqual(self.exchange(request("result = 10"))["result"], 10)
+        self.assertEqual(self.exchange(request(generation="foreign"))["error"]["code"], "generation_mismatch")
+
+    def test_disconnected_pending_request_is_cancelled(self):
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.connect(self.path)
+        connection.sendall(protocol.encode_frame(request("x = 'should not execute'"), protocol.MAX_REQUEST))
+        connection.close()
+        self.service.tick()
+        self.assertNotIn("x", self.service.namespace)
+
+    def test_second_admitted_frame_is_busy(self):
+        connections = [socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(2)]
+        try:
+            for connection in connections:
+                connection.connect(self.path)
+                connection.sendall(protocol.encode_frame(request(), protocol.MAX_REQUEST))
+            for _ in range(5):
+                self.service.tick()
+            values = [protocol.receive_frame(c, protocol.MAX_RESPONSE, time.monotonic() + 2) for c in connections]
+            self.assertEqual(sum(value["ok"] for value in values), 1)
+            self.assertEqual(next(v for v in values if not v["ok"])["error"]["code"], "busy")
+        finally:
+            for connection in connections:
+                connection.close()
+
+    def test_request_during_execution_is_busy(self):
+        pending = []
+        def concurrent_request():
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.connect(self.path)
+            connection.sendall(protocol.encode_frame(request("result = 99"), protocol.MAX_REQUEST))
+            pending.append(connection)
+        self.service.namespace["during"] = concurrent_request
+        first = self.exchange(request("during()\nx = 7"))
+        self.assertTrue(first["ok"])
+        for _ in range(5):
+            self.service.tick()
+        with pending[0]:
+            second = protocol.receive_frame(pending[0], protocol.MAX_RESPONSE, time.monotonic() + 2)
+        self.assertEqual(second["error"]["code"], "busy")
+        self.assertEqual(self.service.namespace["x"], 7)
+
+
 if __name__ == "__main__":
     unittest.main()

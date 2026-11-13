@@ -15,6 +15,25 @@ TEST_TMP = Path("/apdcephfs_zwfy7/share_305994131/xyuanzhang/tmp")
 
 
 class ManagementTests(unittest.TestCase):
+    def test_display_probe_timeout_is_retried(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(manage.subprocess, "run", side_effect=[
+                manage.subprocess.TimeoutExpired("xdpyinfo", 15), mock.Mock(returncode=0)]) as run, \
+                mock.patch.object(manage.time, "sleep"):
+            manage.wait_display(process, {"DISPLAY": ":999"}, [False])
+        self.assertEqual(run.call_count, 2)
+
+    def test_display_probe_refuses_exited_or_cancelled_server(self):
+        with mock.patch.object(manage.subprocess, "run") as run:
+            process = mock.Mock()
+            process.poll.return_value = 1
+            with self.assertRaisesRegex(RuntimeError, "exited"):
+                manage.wait_display(process, {}, [False])
+            with self.assertRaisesRegex(RuntimeError, "stopped"):
+                manage.wait_display(process, {}, [True])
+            run.assert_not_called()
+
     def test_names_reject_paths_and_shell_syntax(self):
         for name in ("", "../A", "/tmp/A", "a b", "A;touch", "A" * 33, "-A"):
             with self.subTest(name=name), self.assertRaises(ValueError):

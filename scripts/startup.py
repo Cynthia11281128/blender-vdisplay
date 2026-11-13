@@ -7,7 +7,7 @@ import bpy
 import gpu
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from control_server import ControlServer
+from control_server import ControlServer, PollingControlServer
 
 
 state_dir = Path(os.environ["BLENDER_STATE_DIR"])
@@ -16,8 +16,9 @@ bpy.context.preferences.view.show_splash = False
 bpy.context.scene.render.threads_mode = "FIXED"
 bpy.context.scene.render.threads = threads
 bpy.context.scene.cycles.device = "CPU"
-control_server = ControlServer(os.environ["BLENDER_CONTROL_SOCKET"],
-                               os.environ["BLENDER_SESSION_TOKEN"], bpy).start()
+server_type = PollingControlServer if os.environ.get("BLENDER_CONTROL_MODE") == "polling" else ControlServer
+control_server = server_type(os.environ["BLENDER_CONTROL_SOCKET"],
+                             os.environ["BLENDER_SESSION_TOKEN"], bpy).start()
 
 
 def record_session():

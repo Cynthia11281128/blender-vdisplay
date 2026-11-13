@@ -17,6 +17,18 @@
 ./blenderctl screenshot B
 ```
 
+程序化视口截图可使用无 Python 后台线程的控制入口：
+
+```bash
+./blenderctl start viewport --control-mode polling
+```
+
+该选项只影响新会话。默认仍为 `threaded`；`polling` 使用 GUI 主线程 timer
+非阻塞接收和发送同一协议，避免 Python socket 线程与 Blender 绘制并发。
+执行期间 GUI 不响应新任务；已排队的并发连接得到 `busy`，不自动执行。
+`status --json` 的 `control.mode` 记录入口模式。修改模式须先保存、停止，再启动。
+Xvfb 启动探测每次最多等待 15 秒、总计 30 秒，探测超时可以重试。
+
 停止前先保存场景；下面命令不自动保存 `.blend`：
 
 ```bash
@@ -58,7 +70,7 @@ Blender 以该项目目录作为工作目录启动；不会自动保存场景。
 `list` 包含已停止实例；目前没有删除实例的命令。
 
 旧单实例配置与日志保留原位置，不自动迁入 `default`。
-所有 session 共用 `blender-vdisplay` 账号，这不是多用户安全隔离。
+所有 session 共用 `blender-vdisplay` 账号，普通 session 之间不是安全隔离；需要隔离时用下文的沙箱 session。
 
 ## 本机程序控制
 
@@ -142,6 +154,46 @@ response = execute(socket_path, generation, "result = len(bpy.data.objects)",
 测试结果保留在 `tmp/bc-*/results.json`，不写生产 artifacts。
 Xvfb 仍短暂创建系统 `/tmp/.X11-unix` socket 和显示锁，它们是 X11 运行资源，
 不是测试临时文件；finally 验证本次资源和进程已清理。
+
+## 沙箱 session（可选）
+
+root 终端执行，给不可信代码一个只看得到白名单路径的 Blender：
+
+```bash
+./blenderctl start NAME --sandbox /abs/spec.json --cpu-count 2
+./blenderctl status NAME --json      # 多一个 sandbox 字段
+./blenderctl stop NAME --generation TOKEN
+```
+
+spec 是 JSON，键必须正好是这几个：
+
+```json
+{"schema_version": 1, "read_only": ["/abs/task"], "read_write": ["/abs/out"], "tmpdir": "/abs/out/tmp"}
+```
+
+- 路径须为已存在、已 resolve 的绝对路径，互不重叠，不得是系统目录或 blenderctl 自己的
+  state/home/config/projects/screenshots。`read_write`、`tmpdir` 须属于专用账号，`tmpdir`
+  须在某个 `read_write` 之内；不自动 chown。
+- 进程在新的 mount/pid/net/ipc/uts namespace 中运行，`pivot_root` 到 tmpfs 搭建的新根：
+  只有 `/usr`、`/etc` 中少量文件、Blender 程序、`scripts/`、本 session 的
+  state/runtime/config/project 与 spec 路径。其它 session、数据集、外网、宿主
+  loopback 端口和外部进程都不可达。`TMPDIR/TMP/TEMP` 设为 spec 的 `tmpdir`。
+- supervisor 是 namespace 的 pid 1，它退出时内核杀掉 namespace 内全部进程。
+- 宿主侧存活判断只信 root 所有的 `STATE_ROOT/sandbox/NAME.json`；`session.json` 里的 pid
+  属于 namespace 内部，`status --json` 的 `supervisor`/`blender`/`xvfb` 也是内部 pid。
+- 沙箱 session 只能由 root 启动；`screenshot`、`attach` 明确报错（宿主看不到其 X 和 tmux），
+  视口图请经 `exec` 渲染。`list` 正常显示。
+- `--cpu-count N` 也可用于普通 session（默认 8）；`--cpus` 优先。
+- `stop --generation TOKEN` 在操作锁内比对 generation，不符则不发信号。
+
+不防：内存耗尽（无 cgroup）、在 namespace 内改 CPU 亲和性、内核漏洞。依赖 root 的
+`CAP_SYS_ADMIN`、`/usr/bin/unshare`（util-linux 2.32.1，需 `--kill-child`）与
+`/usr/sbin/pivot_root`；权限不足时启动明确失败，不退化为非沙箱。
+
+```bash
+/usr/bin/python3 -I -B scripts/test_sandbox.py               # 离线
+/usr/bin/python3 -I -B scripts/test_sandbox_live.py --run    # 实机，root，启停自己的 sbxtest- session
+```
 
 安装和验收记录、实际路径及容器重建注意事项见
 [部署报告](../../docs/infra/blender_deployment_report.md)。
